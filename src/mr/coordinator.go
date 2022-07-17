@@ -7,17 +7,25 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
 	// Your definitions here.
 
-	MapTasks    map[int]Task
-	ReduceTasks map[int]Task
+	MapTasks    map[int]TaskCandidate
+	ReduceTasks map[int]TaskCandidate
 	NReduce     int
 	NMap        int
 
 	mutex sync.Mutex
+}
+
+type TaskCandidate struct {
+	Type      int
+	FileName  string
+	Status    int
+	StartTime time.Time
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -39,23 +47,27 @@ func (c *Coordinator) AssignTask(args *Task, reply *Task) error {
 		mapTask := c.MapTasks[args.Id]
 		mapTask.Status = Idle
 		c.MapTasks[args.Id] = mapTask
+		// log.Printf("map %d failed", args.Id)
 	} else if args.Type == Map && args.Status == Success {
 		delete(c.MapTasks, args.Id)
+		// log.Printf("map %d success", args.Id)
 	}
 
 	if args.Type == Reduce && args.Status != Success {
 		reduceTask := c.ReduceTasks[args.Id]
 		reduceTask.Status = Idle
 		c.ReduceTasks[args.Id] = reduceTask
+		// log.Printf("reduce %d failed", args.Id)
 	} else if args.Type == Reduce && args.Status == Success {
 		delete(c.ReduceTasks, args.Id)
+		// log.Printf("reduce %d success", args.Id)
 	}
 
 	reply.Type = Empty
 
 	if len(c.MapTasks) != 0 {
 		for id, mapTask := range c.MapTasks {
-			if mapTask.Status == Running {
+			if mapTask.Status == Running && time.Since(mapTask.StartTime)/time.Second < 10 {
 				continue
 			}
 			reply.Type = Map
@@ -63,11 +75,14 @@ func (c *Coordinator) AssignTask(args *Task, reply *Task) error {
 			reply.FileName = mapTask.FileName
 			reply.NReduce = c.NReduce
 			mapTask.Status = Running
+			mapTask.StartTime = time.Now()
+			c.MapTasks[id] = mapTask
+			// log.Println(id)
 			break
 		}
 	} else if len(c.ReduceTasks) != 0 {
 		for id, reduceTask := range c.ReduceTasks {
-			if reduceTask.Status == Running {
+			if reduceTask.Status == Running && time.Since(reduceTask.StartTime)/time.Second < 10 {
 				continue
 			}
 			reply.Type = Reduce
@@ -75,6 +90,8 @@ func (c *Coordinator) AssignTask(args *Task, reply *Task) error {
 			reply.NMap = c.NMap
 			reply.NReduce = c.NReduce
 			reduceTask.Status = Running
+			reduceTask.StartTime = time.Now()
+			c.ReduceTasks[id] = reduceTask
 			break
 		}
 	}
@@ -125,20 +142,21 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	c.MapTasks = make(map[int]Task)
-	c.ReduceTasks = make(map[int]Task)
+	c.MapTasks = make(map[int]TaskCandidate)
+	c.ReduceTasks = make(map[int]TaskCandidate)
 	c.NReduce = nReduce
+	c.mutex = sync.Mutex{}
 
 	// generate map tasks
 	for i, file := range files {
-		mapTask := Task{Id: i, Type: Map, FileName: file, Status: Idle, NReduce: c.NReduce}
+		mapTask := TaskCandidate{Type: Map, FileName: file, Status: Idle}
 		c.MapTasks[i] = mapTask
 	}
 	c.NMap = len(c.MapTasks)
 
 	// generate reduce tasks
 	for id := 0; id < nReduce; id++ {
-		reduceTask := Task{Id: id, Type: Reduce, Status: Idle, NReduce: c.NReduce}
+		reduceTask := TaskCandidate{Type: Reduce, Status: Idle}
 		c.ReduceTasks[id] = reduceTask
 	}
 

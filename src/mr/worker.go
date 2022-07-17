@@ -60,7 +60,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if newTask.Type == Empty {
-			time.Sleep(2 * time.Second)
+			time.Sleep(time.Second)
 		} else if newTask.Type == Map {
 			mapTask(mapf, &newTask)
 		} else if newTask.Type == Reduce {
@@ -111,7 +111,6 @@ func mapTask(mapf func(string, string) []KeyValue, task *Task) {
 		err := encs[ihash(kv.Key)%task.NReduce].Encode(kv)
 		if err != nil {
 			log.Fatalf("error encoding %s", kv)
-			file.Close()
 			task.Status = Failed
 			return
 		}
