@@ -62,9 +62,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		if newTask.Type == Empty {
 			time.Sleep(time.Second)
 		} else if newTask.Type == Map {
-			mapTask(mapf, &newTask)
+			doMapTask(mapf, &newTask)
 		} else if newTask.Type == Reduce {
-			reduceTask(reducef, &newTask)
+			doReduceTask(reducef, &newTask)
 		}
 
 		lastTask = newTask
@@ -72,7 +72,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
-func mapTask(mapf func(string, string) []KeyValue, task *Task) {
+func doMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	task.Status = Running
 
 	file, err := os.Open(task.FileName)
@@ -123,7 +123,7 @@ func mapTask(mapf func(string, string) []KeyValue, task *Task) {
 	task.Status = Success
 }
 
-func reduceTask(reducef func(string, []string) string, task *Task) {
+func doReduceTask(reducef func(string, []string) string, task *Task) {
 	task.Status = Running
 
 	intermediate := []KeyValue{}
