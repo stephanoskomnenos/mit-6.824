@@ -53,9 +53,9 @@ type ApplyMsg struct {
 }
 
 const (
-	Follower = iota
-	Candidate
-	Leader
+	RfFollower = iota
+	RfCandidate
+	RfLeader
 )
 
 const (
@@ -108,7 +108,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
-	isleader = rf.state == Leader
+	isleader = rf.state == RfLeader
 
 	return term, isleader
 }
@@ -198,7 +198,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2B
 
-	if args.Term > rf.currentTerm || rf.state != Follower {
+	if args.Term > rf.currentTerm || rf.state != RfFollower {
 		log.Printf("AppendEntries: raft %d update current term from %d to %d", rf.me, rf.currentTerm, args.Term)
 		rf.currentTerm = args.Term
 	}
@@ -230,13 +230,16 @@ func (rf *Raft) broatcastHeartbeat() {
 				return
 			}
 
-			if !reply.Success {
+			if reply.Success {
 				return
 			}
 
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
-				rf.convertTo(follower)
+				rf.convertTo(RfFollower)
 			}
 		}(follower)
 	}
@@ -274,7 +277,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// election finished
 	if args.Term > rf.currentTerm {
-		rf.convertTo(Follower)
+		rf.convertTo(RfFollower)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
@@ -362,27 +365,26 @@ func (rf *Raft) startElection() {
 			if reply.VoteGranted && rf.currentTerm == reply.Term {
 				voteCount++
 				if voteCount > len(rf.peers)/2 {
-					rf.convertTo(Leader)
+					rf.convertTo(RfLeader)
 					// start broadcast heartbeat
 					log.Printf("Election: %d becomes leader, current term %d", rf.me, rf.currentTerm)
 					rf.broatcastHeartbeat()
 				}
 			} else if rf.currentTerm < reply.Term {
-				rf.convertTo(Follower)
+				rf.convertTo(RfFollower)
 			}
 		}(peer)
 	}
-
 }
 
 func (rf *Raft) convertTo(state int) {
 	switch state {
-	case Candidate:
-		rf.state = Candidate
-	case Follower:
-		rf.state = Follower
-	case Leader:
-		rf.state = Leader
+	case RfCandidate:
+		rf.state = RfCandidate
+	case RfFollower:
+		rf.state = RfFollower
+	case RfLeader:
+		rf.state = RfLeader
 	}
 }
 
@@ -443,7 +445,7 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
-			rf.convertTo(Candidate)
+			rf.convertTo(RfCandidate)
 			rf.currentTerm += 1
 			rf.startElection()
 			rf.electionTimer.Reset(electionRandomDuration())
@@ -451,7 +453,7 @@ func (rf *Raft) ticker() {
 
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
-			if rf.state == Leader {
+			if rf.state == RfLeader {
 				rf.broatcastHeartbeat()
 			}
 			rf.mu.Unlock()
@@ -488,7 +490,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
+	rf.state = RfFollower
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
