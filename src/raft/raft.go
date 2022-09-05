@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -86,7 +88,7 @@ const (
 
 const (
 	HeartbeatInterval    = 100 * time.Millisecond
-	ElectionBaseInterval = 600 * time.Millisecond
+	ElectionBaseInterval = 1000 * time.Millisecond
 )
 
 //
@@ -163,6 +165,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -185,6 +195,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+
+		DPrintf("ReadPersist: raft %d error", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -220,15 +246,15 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 
-	// 2B if args.PrevLogIndex > len(rf.log)-1, return this to reset nextIndex
-	LastLogIndex int
+	// 2B student's guide
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.LastLogIndex = -1
+	reply.ConflictIndex = -1
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -238,16 +264,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 2B
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.log)-1 < args.PrevLogIndex {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		if len(rf.log)-1 < args.PrevLogIndex {
-			reply.LastLogIndex = len(rf.log) - 1
-			DPrintf("AppendEntries: raft %d rejects append entries due to log, len(rf.log)=%d, args.PrevLogIndex=%d", rf.me, len(rf.log), args.PrevLogIndex)
-		} else {
-			DPrintf("AppendEntries: raft %d rejects append entries due to log, rf.log[args.PrevLogIndex].Term=%d, args.PrevLogTerm=%d, current term %d", rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, rf.currentTerm)
-			rf.log = rf.log[:args.PrevLogIndex]
+
+		reply.ConflictIndex = len(rf.log)
+		DPrintf("AppendEntries: raft %d rejects append entries due to log, len(rf.log)=%d, args.PrevLogIndex=%d", rf.me, len(rf.log), args.PrevLogIndex)
+		return
+	}
+
+	// 2B
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+
+		reply.ConflictIndex = 1
+		for i, logEntry := range rf.log {
+			if logEntry.Term == rf.log[args.PrevLogIndex].Term {
+				reply.ConflictIndex = i
+				break
+			}
 		}
+
+		DPrintf("AppendEntries: raft %d rejects append entries due to log, rf.log[args.PrevLogIndex].Term=%d, args.PrevLogTerm=%d, current term %d", rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, rf.currentTerm)
+		rf.log = rf.log[:args.PrevLogIndex]
+
+		rf.persist()
 		return
 	}
 
@@ -269,6 +311,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.sendApplyMsg()
 		DPrintf("AppendEntries: raft %d updates commitIndex to %d, %v", rf.me, rf.commitIndex, rf.log[:rf.commitIndex+1])
 	}
+
+	rf.persist()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -318,6 +362,8 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.currentTerm = reply.Term
 				rf.convertTo(RfFollower)
 
+				rf.persist()
+
 				DPrintf("AppendEntries: failed, raft %d converts to follower", rf.me)
 
 				return
@@ -347,8 +393,8 @@ func (rf *Raft) broadcastHeartbeat() {
 				DPrintf("AppendEntries: success, commitIndex=%d, matchIndex[%d]=%d, nextIndex[%d]=%d", rf.commitIndex, follower, rf.matchIndex[follower], follower, rf.nextIndex[follower])
 
 			} else {
-				if reply.LastLogIndex != -1 {
-					rf.nextIndex[follower] = reply.LastLogIndex + 1
+				if reply.ConflictIndex != -1 {
+					rf.nextIndex[follower] = reply.ConflictIndex
 				} else if rf.nextIndex[follower] >= 2 {
 					rf.nextIndex[follower] -= 1
 				}
@@ -395,6 +441,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.convertTo(RfFollower)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+
+		rf.persist()
 	}
 
 	if args.Term < rf.currentTerm {
@@ -414,6 +462,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.electionTimer.Reset(electionRandomDuration())
+
+		rf.persist()
 
 		DPrintf("RequestVote: raft %d accepts %d's request, current term %d", rf.me, args.CandidateId, rf.currentTerm)
 		return
@@ -551,6 +601,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.nextIndex[rf.me] = len(rf.log)
 		rf.broadcastHeartbeat()
+
+		rf.persist()
 
 		DPrintf("Start: leader %d, index %d, %v", rf.me, index, rf.log[index])
 	}
