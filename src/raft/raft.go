@@ -52,10 +52,17 @@ type ApplyMsg struct {
 }
 
 func (rf *Raft) sendApplyMsg() {
+	rf.applyMu.Lock()
+	defer rf.applyMu.Unlock()
+
 	rf.mu.Lock()
+	rf.lastApplied = min(rf.lastApplied, rf.commitIndex)
 	lastApplied := rf.lastApplied
-	logs := rf.log[rf.lastApplied+1 : rf.commitIndex+1]
+	logs := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+	copy(logs, rf.log[rf.lastApplied+1:rf.commitIndex+1])
 	rf.lastApplied += len(logs)
+
+	DPrintf("ApplyMsg: raft %d sending logs from index %d to %d, %v", rf.me, lastApplied+1, rf.commitIndex, logs)
 	rf.mu.Unlock()
 
 	for i, log := range logs {
@@ -65,9 +72,9 @@ func (rf *Raft) sendApplyMsg() {
 			CommandIndex: lastApplied + 1 + i,
 		}
 
-		rf.applyCh <- applyMsg
+		DPrintf("ApplyMsg: raft %d, send log with index %d, %v", rf.me, lastApplied+1+i, log.Command)
 
-		DPrintf("ApplyMsg: raft %d, send log with index %d", rf.me, i)
+		rf.applyCh <- applyMsg
 	}
 }
 
@@ -79,7 +86,7 @@ const (
 
 const (
 	HeartbeatInterval    = 100 * time.Millisecond
-	ElectionBaseInterval = 150 * time.Millisecond
+	ElectionBaseInterval = 600 * time.Millisecond
 )
 
 //
@@ -116,6 +123,8 @@ type Raft struct {
 
 	// for test
 	applyCh chan ApplyMsg
+
+	applyMu sync.Mutex
 }
 
 type LogEntry struct {
@@ -251,14 +260,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	// DPrintf("AppendEntries: raft %d accepts append entries, commitIndex=%d, leaderCommit=%d", rf.me, rf.commitIndex, args.LeaderCommit)
 	if len(args.Entries) > 0 {
-		DPrintf("AppendEntries: raft %d accepts append entries, len(args.Entries)=%d", rf.me, len(args.Entries))
+		DPrintf("AppendEntries: raft %d accepts append entries, len(args.Entries)=%d, log %v", rf.me, len(args.Entries), rf.log)
 	}
 
 	// 2B
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		go rf.sendApplyMsg()
-		DPrintf("AppendEntries: raft %d updates commitIndex to %d", rf.me, rf.commitIndex)
+		DPrintf("AppendEntries: raft %d updates commitIndex to %d, %v", rf.me, rf.commitIndex, rf.log[:rf.commitIndex+1])
 	}
 
 	reply.Term = rf.currentTerm
@@ -295,7 +304,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			LeaderCommit: rf.commitIndex,
 		}
 
-		go func(follower int) {
+		go func(follower int, prevLogIndex int) {
 			reply := &AppendEntriesReply{}
 
 			if !rf.sendAppendEntries(follower, args, reply) {
@@ -304,6 +313,15 @@ func (rf *Raft) broadcastHeartbeat() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.convertTo(RfFollower)
+
+				DPrintf("AppendEntries: failed, raft %d converts to follower", rf.me)
+
+				return
+			}
 
 			if reply.Success {
 				// 2B
@@ -336,14 +354,7 @@ func (rf *Raft) broadcastHeartbeat() {
 				}
 				DPrintf("AppendEntries: failed, update nextIndex[%d] to %d", follower, rf.nextIndex[follower])
 			}
-
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.convertTo(RfFollower)
-
-				DPrintf("AppendEntries: failed, raft %d converts to follower", rf.me)
-			}
-		}(follower)
+		}(follower, prevLogIndex)
 	}
 
 	rf.heartbeatTimer.Reset(heartbeatDuration())
@@ -397,7 +408,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2B: add logs check
 	// DPrintf("RequestVote: raft %d, args.LastLogTerm=%d, args.LastLogIndex=%d", rf.me, args.LastLogTerm, args.LastLogIndex)
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		(args.LastLogTerm >= rf.log[len(rf.log)-1].Term || args.LastLogIndex > len(rf.log)-1) {
+		(args.LastLogTerm > rf.log[len(rf.log)-1].Term || (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1)) {
 
 		reply.Term = rf.currentTerm
 		rf.votedFor = args.CandidateId
@@ -541,7 +552,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = len(rf.log)
 		rf.broadcastHeartbeat()
 
-		DPrintf("Start: leader %d, index %d", rf.me, index)
+		DPrintf("Start: leader %d, index %d, %v", rf.me, index, rf.log[index])
 	}
 
 	return index, term, isLeader
