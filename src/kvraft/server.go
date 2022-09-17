@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ const (
 )
 
 const ExecutionTimeout = time.Millisecond * 10000
+const SnapshotCheckInterval = time.Millisecond * 50
 
 type Op struct {
 	// Your definitions here.
@@ -53,9 +55,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	storage       map[string]string
-	waitChans     map[int](chan Op)
-	lastRequestId map[int64]int
+	storage          map[string]string
+	waitChans        map[int](chan Op)
+	lastRequestId    map[int64]int
+	lastCommandIndex int
 }
 
 func (kv *KVServer) getWaitChan(index int) chan Op {
@@ -68,6 +71,17 @@ func (kv *KVServer) getWaitChan(index int) chan Op {
 		kv.waitChans[index] = ch
 	}
 	return ch
+}
+
+func (kv *KVServer) closeWaitChan(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	select {
+	case <-kv.waitChans[index]:
+		close(kv.waitChans[index])
+	default:
+	}
 }
 
 func isSameRequest(p Op, q Op) bool {
@@ -119,7 +133,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		DPrintf("Server %d GET request no.%d timeout", kv.me, index)
 	}
 
-	close(kv.getWaitChan(index))
+	go func(index int) {
+		kv.closeWaitChan(index)
+	}(index)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -160,7 +176,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		DPrintf("Server %d PUT/APPEND request no.%d timeout", kv.me, index)
 	}
 
-	close(kv.getWaitChan(index))
+	go func(index int) {
+		kv.closeWaitChan(index)
+	}(index)
 }
 
 func (kv *KVServer) applier() {
@@ -187,14 +205,67 @@ func (kv *KVServer) applier() {
 					}
 				}
 				kv.lastRequestId[op.ClientId] = op.RequestId
+				kv.lastCommandIndex = applyMsg.CommandIndex
 				kv.mu.Unlock()
 
 				waitCh := kv.getWaitChan(applyMsg.CommandIndex)
 				go func(op Op, ch chan Op) {
 					ch <- op
 				}(op, waitCh)
+			} else if applyMsg.SnapshotValid {
+				kv.mu.Lock()
+				// install snapshot
+				if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+					kv.InstallSnapshot(applyMsg.Snapshot)
+				}
+				kv.mu.Unlock()
 			}
 		}
+	}
+}
+
+func (kv *KVServer) snapshotMaker() {
+	lastSnapshotIndex := 0
+	for !kv.killed() {
+		kv.mu.Lock()
+		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate && lastSnapshotIndex < kv.lastCommandIndex {
+			kv.CreateSnapShot()
+			lastSnapshotIndex = kv.lastCommandIndex
+		}
+		kv.mu.Unlock()
+
+		time.Sleep(SnapshotCheckInterval)
+	}
+}
+
+func (kv *KVServer) CreateSnapShot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.storage)
+	e.Encode(kv.lastRequestId)
+	e.Encode(kv.lastCommandIndex)
+	lastIncludedIndex := kv.lastCommandIndex
+
+	DPrintf("Server %d CreateSnapshot index %d", kv.me, lastIncludedIndex)
+	kv.rf.Snapshot(lastIncludedIndex, w.Bytes())
+}
+
+func (kv *KVServer) InstallSnapshot(snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var storage map[string]string
+	var lastRequestId map[int64]int
+	var lastIncludedIndex int
+	if d.Decode(&storage) != nil ||
+		d.Decode(&lastRequestId) != nil ||
+		d.Decode(&lastIncludedIndex) != nil {
+
+		DPrintf("InstallSnapshot: server %d error", kv.me)
+	} else {
+		kv.storage = storage
+		kv.lastRequestId = lastRequestId
+		kv.lastCommandIndex = lastIncludedIndex
+		DPrintf("Server %d Installsnapshot index %d", kv.me, lastIncludedIndex)
 	}
 }
 
@@ -248,11 +319,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.storage = make(map[string]string)
 	kv.waitChans = make(map[int]chan Op)
 	kv.lastRequestId = make(map[int64]int)
+	kv.lastCommandIndex = 0
+	kv.InstallSnapshot(persister.ReadSnapshot())
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 
 	go kv.applier()
+
+	go kv.snapshotMaker()
 
 	return kv
 }
