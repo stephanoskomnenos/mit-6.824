@@ -87,7 +87,7 @@ const (
 
 const (
 	HeartbeatInterval    = 100 * time.Millisecond
-	ElectionBaseInterval = 800 * time.Millisecond
+	ElectionBaseInterval = 1500 * time.Millisecond
 )
 
 //
@@ -386,6 +386,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// add in 2D, make sure commitIndex increases monotonically
 	if args.PrevLogIndex < rf.commitIndex {
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
